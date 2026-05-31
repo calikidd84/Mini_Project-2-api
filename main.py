@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from typing import List, Optional, Union
+from typing import Any, Optional, Type
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,6 +40,32 @@ def get_db():
         db.close()
 
 
+def parse_include(include: Optional[str], allowed_fields: set[str]) -> Optional[set[str]]:
+    if include is None:
+        return None
+
+    fields = {field.strip() for field in include.split(",") if field.strip()}
+    if not fields:
+        return None
+
+    invalid_fields = fields - allowed_fields
+    if invalid_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid include field(s): {', '.join(sorted(invalid_fields))}",
+        )
+
+    return fields
+
+
+def serialize_item(item: Any, schema: Type[Any], include: Optional[set[str]] = None):
+    return schema.model_validate(item).model_dump(mode="json", include=include)
+
+
+def serialize_list(items: list[Any], schema: Type[Any], include: Optional[set[str]] = None):
+    return [serialize_item(item, schema, include) for item in items]
+
+
 @app.get("/")
 def read_root():
     return {"message": "Video Games API is running"}
@@ -48,8 +74,9 @@ def read_root():
 # -------------------------
 # Stats
 # -------------------------
-@app.get("/stats", response_model=Union[schemas.StatsRead, schemas.FilteredTopGamesStat])
+@app.get("/stats")
 def get_stats(
+    include: Optional[str] = Query(default=None),
     publisher_id: Optional[int] = Query(default=None, ge=1),
     console_id: Optional[int] = Query(default=None, ge=1),
     db: Session = Depends(get_db),
@@ -59,6 +86,61 @@ def get_stats(
             status_code=400,
             detail="Use either publisher_id or console_id, not both",
         )
+
+    if publisher_id is not None:
+        filtered_include = parse_include(include, {"filter_type", "filter_id", "name", "games"})
+        publisher = db.query(models.Publisher).filter(models.Publisher.id == publisher_id).first()
+        if not publisher:
+            raise HTTPException(status_code=404, detail="Publisher not found")
+
+        top_games = (
+            db.query(models.Game)
+            .filter(models.Game.publisher_id == publisher.id, models.Game.fan_rating.isnot(None))
+            .order_by(desc(models.Game.fan_rating), desc(models.Game.vote_count), models.Game.title)
+            .limit(5)
+            .all()
+        )
+        data = {
+            "filter_type": "publisher",
+            "filter_id": publisher.id,
+            "name": publisher.name,
+            "games": top_games,
+        }
+        return serialize_item(data, schemas.FilteredTopGamesStat, filtered_include)
+
+    if console_id is not None:
+        filtered_include = parse_include(include, {"filter_type", "filter_id", "name", "games"})
+        console = db.query(models.Console).filter(models.Console.id == console_id).first()
+        if not console:
+            raise HTTPException(status_code=404, detail="Console not found")
+
+        top_games = (
+            db.query(models.Game)
+            .join(models.Game.consoles)
+            .filter(models.Console.id == console.id, models.Game.fan_rating.isnot(None))
+            .order_by(desc(models.Game.fan_rating), desc(models.Game.vote_count), models.Game.title)
+            .limit(5)
+            .all()
+        )
+        data = {
+            "filter_type": "console",
+            "filter_id": console.id,
+            "name": console.name,
+            "games": top_games,
+        }
+        return serialize_item(data, schemas.FilteredTopGamesStat, filtered_include)
+
+    stats_include = parse_include(
+        include,
+        {
+            "console_ratings",
+            "game_ratings",
+            "publishers_best_5_games",
+            "best_publisher",
+            "best_console",
+            "top_game",
+        },
+    )
 
     console_average, console_count = (
         db.query(func.avg(models.Console.fan_rating), func.count(models.Console.fan_rating))
@@ -81,45 +163,6 @@ def get_stats(
         .order_by(desc(average_game_rating), desc(rated_game_count))
         .first()
     )
-
-    if publisher_id is not None:
-        publisher = db.query(models.Publisher).filter(models.Publisher.id == publisher_id).first()
-        if not publisher:
-            raise HTTPException(status_code=404, detail="Publisher not found")
-
-        top_games = (
-            db.query(models.Game)
-            .filter(models.Game.publisher_id == publisher.id, models.Game.fan_rating.isnot(None))
-            .order_by(desc(models.Game.fan_rating), desc(models.Game.vote_count), models.Game.title)
-            .limit(5)
-            .all()
-        )
-        return {
-            "filter_type": "publisher",
-            "filter_id": publisher.id,
-            "name": publisher.name,
-            "games": top_games,
-        }
-
-    if console_id is not None:
-        console = db.query(models.Console).filter(models.Console.id == console_id).first()
-        if not console:
-            raise HTTPException(status_code=404, detail="Console not found")
-
-        top_games = (
-            db.query(models.Game)
-            .join(models.Game.consoles)
-            .filter(models.Console.id == console.id, models.Game.fan_rating.isnot(None))
-            .order_by(desc(models.Game.fan_rating), desc(models.Game.vote_count), models.Game.title)
-            .limit(5)
-            .all()
-        )
-        return {
-            "filter_type": "console",
-            "filter_id": console.id,
-            "name": console.name,
-            "games": top_games,
-        }
 
     publishers_best_5_games = []
     publishers = db.query(models.Publisher).order_by(models.Publisher.name).all()
@@ -155,7 +198,7 @@ def get_stats(
             "rated_game_count": publisher_count,
         }
 
-    return {
+    data = {
         "console_ratings": {
             "average_fan_rating": console_average,
             "rated_count": console_count,
@@ -169,22 +212,33 @@ def get_stats(
         "best_console": best_console,
         "top_game": top_game,
     }
+    return serialize_item(data, schemas.StatsRead, stats_include)
 
 
 # -------------------------
 # Publishers
 # -------------------------
-@app.get("/publishers", response_model=List[schemas.PublisherRead])
-def get_publishers(db: Session = Depends(get_db)):
-    return db.query(models.Publisher).all()
+@app.get("/publishers")
+def get_publishers(
+    include: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    include_fields = parse_include(include, {"id", "name", "country", "founded_year"})
+    publishers = db.query(models.Publisher).all()
+    return serialize_list(publishers, schemas.PublisherRead, include_fields)
 
 
-@app.get("/publishers/{publisher_id}", response_model=schemas.PublisherRead)
-def get_publisher(publisher_id: int, db: Session = Depends(get_db)):
+@app.get("/publishers/{publisher_id}")
+def get_publisher(
+    publisher_id: int,
+    include: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    include_fields = parse_include(include, {"id", "name", "country", "founded_year"})
     publisher = db.query(models.Publisher).filter(models.Publisher.id == publisher_id).first()
     if not publisher:
         raise HTTPException(status_code=404, detail="Publisher not found")
-    return publisher
+    return serialize_item(publisher, schemas.PublisherRead, include_fields)
 
 
 @app.post("/publishers", response_model=schemas.PublisherRead, status_code=status.HTTP_201_CREATED)
@@ -229,17 +283,33 @@ def delete_publisher(publisher_id: int, db: Session = Depends(get_db)):
 # -------------------------
 # Consoles
 # -------------------------
-@app.get("/consoles", response_model=List[schemas.ConsoleRead])
-def get_consoles(db: Session = Depends(get_db)):
-    return db.query(models.Console).all()
+@app.get("/consoles")
+def get_consoles(
+    include: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    include_fields = parse_include(
+        include,
+        {"id", "name", "manufacturer", "release_year", "fan_rating", "vote_count"},
+    )
+    consoles = db.query(models.Console).all()
+    return serialize_list(consoles, schemas.ConsoleRead, include_fields)
 
 
-@app.get("/consoles/{console_id}", response_model=schemas.ConsoleRead)
-def get_console(console_id: int, db: Session = Depends(get_db)):
+@app.get("/consoles/{console_id}")
+def get_console(
+    console_id: int,
+    include: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    include_fields = parse_include(
+        include,
+        {"id", "name", "manufacturer", "release_year", "fan_rating", "vote_count"},
+    )
     console = db.query(models.Console).filter(models.Console.id == console_id).first()
     if not console:
         raise HTTPException(status_code=404, detail="Console not found")
-    return console
+    return serialize_item(console, schemas.ConsoleRead, include_fields)
 
 
 @app.post("/consoles", response_model=schemas.ConsoleRead, status_code=status.HTTP_201_CREATED)
@@ -284,17 +354,53 @@ def delete_console(console_id: int, db: Session = Depends(get_db)):
 # -------------------------
 # Games
 # -------------------------
-@app.get("/games", response_model=List[schemas.GameRead])
-def get_games(db: Session = Depends(get_db)):
-    return db.query(models.Game).all()
+@app.get("/games")
+def get_games(
+    include: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    include_fields = parse_include(
+        include,
+        {
+            "id",
+            "title",
+            "genre",
+            "release_year",
+            "publisher_id",
+            "fan_rating",
+            "vote_count",
+            "publisher",
+            "consoles",
+        },
+    )
+    games = db.query(models.Game).all()
+    return serialize_list(games, schemas.GameRead, include_fields)
 
 
-@app.get("/games/{game_id}", response_model=schemas.GameRead)
-def get_game(game_id: int, db: Session = Depends(get_db)):
+@app.get("/games/{game_id}")
+def get_game(
+    game_id: int,
+    include: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    include_fields = parse_include(
+        include,
+        {
+            "id",
+            "title",
+            "genre",
+            "release_year",
+            "publisher_id",
+            "fan_rating",
+            "vote_count",
+            "publisher",
+            "consoles",
+        },
+    )
     game = db.query(models.Game).filter(models.Game.id == game_id).first()
     if not game:
         raise HTTPException(status_code=404, detail="Game not found")
-    return game
+    return serialize_item(game, schemas.GameRead, include_fields)
 
 
 @app.post("/games", response_model=schemas.GameRead, status_code=status.HTTP_201_CREATED)
